@@ -1,0 +1,12 @@
+# Binary research artifacts (regenerable; manually downloaded if missing)
+apks/
+reverse/
+jadx-out/
+downloads/
+
+# OS / editor noise
+.DS_Store
+*.swp
+
+# Claude Code session state
+.claude/scheduled_tasks.lock
