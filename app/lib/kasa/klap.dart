@@ -6,6 +6,8 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:pointycastle/export.dart';
 
+import '../diagnostics.dart';
+
 /// KLAP v2 (Kasa MD5 variant) client. Speaks the authenticated local
 /// protocol that 1.1.x+ HS300 firmware exposes on HTTP port 80, with
 /// the hardcoded `kasa@tp-link.net` / `kasaSetup` fallback for devices
@@ -239,6 +241,8 @@ class KlapTransport {
       final clientSeed = KlapClient.randomClientSeed(rng);
 
       // ----- handshake1 -----
+      Diagnostics.instance
+          .event('klap.handshake', 'handshake1 start host=${host.address}');
       final hs1Url = Uri.parse('http://${host.address}/app/handshake1');
       final hs1Req = await client.postUrl(hs1Url).timeout(timeout);
       hs1Req.headers.contentType =
@@ -246,10 +250,20 @@ class KlapTransport {
       hs1Req.add(clientSeed);
       final hs1Resp = await hs1Req.close().timeout(timeout);
       if (hs1Resp.statusCode != 200) {
+        Diagnostics.instance.event(
+          'klap.handshake',
+          'handshake1 failed: HTTP status ${hs1Resp.statusCode}',
+          level: DiagLevel.error,
+        );
         throw KlapException('handshake1 status ${hs1Resp.statusCode}');
       }
       final hs1Body = await _readAll(hs1Resp);
       if (hs1Body.length < 48) {
+        Diagnostics.instance.event(
+          'klap.handshake',
+          'handshake1 failed: body too short (${hs1Body.length}B, need 48)',
+          level: DiagLevel.error,
+        );
         throw KlapException(
             'handshake1 body too short: ${hs1Body.length} bytes (need 48)');
       }
@@ -260,12 +274,21 @@ class KlapTransport {
         authHash: authHash,
         serverConfirm: serverConfirm,
       )) {
+        Diagnostics.instance.event(
+          'klap.handshake',
+          'handshake1 failed: server_confirm mismatch (wrong credentials or '
+          'device bound to a different owner)',
+          level: DiagLevel.error,
+        );
         throw KlapException(
             'handshake1 server_confirm did not match — wrong credentials or device bound to different owner');
       }
+      Diagnostics.instance
+          .event('klap.handshake', 'handshake1 success (server_confirm verified)');
       final cookie = _extractSessionCookie(hs1Resp);
 
       // ----- handshake2 -----
+      Diagnostics.instance.event('klap.handshake', 'handshake2 start');
       final hs2Url = Uri.parse('http://${host.address}/app/handshake2');
       final hs2Req = await client.postUrl(hs2Url).timeout(timeout);
       hs2Req.headers.contentType =
@@ -278,10 +301,17 @@ class KlapTransport {
       );
       final hs2Resp = await hs2Req.close().timeout(timeout);
       if (hs2Resp.statusCode != 200) {
+        Diagnostics.instance.event(
+          'klap.handshake',
+          'handshake2 failed: HTTP status ${hs2Resp.statusCode}',
+          level: DiagLevel.error,
+        );
         throw KlapException('handshake2 status ${hs2Resp.statusCode}');
       }
       // Drain body, ignore content.
       await _readAll(hs2Resp);
+      Diagnostics.instance
+          .event('klap.handshake', 'handshake2 success — session established');
 
       return KlapClient.deriveSession(
         clientSeed: clientSeed,
@@ -289,6 +319,19 @@ class KlapTransport {
         authHash: authHash,
         cookie: cookie,
       );
+    } on KlapException {
+      // Already logged at the specific failure site above.
+      rethrow;
+    } catch (e, st) {
+      // Never interpolate `$e` — e.g. a HandshakeException/SocketException
+      // is not guaranteed not to embed the target host or other detail;
+      // runtimeType + stack trace (source locations only) is sufficient.
+      Diagnostics.instance.event(
+        'klap.handshake',
+        'unexpected failure: ${e.runtimeType}\n$st',
+        level: DiagLevel.error,
+      );
+      rethrow;
     } finally {
       if (httpClient == null) client.close();
     }
@@ -309,6 +352,16 @@ class KlapTransport {
     try {
       final seq = session.nextSeq();
       final encrypted = session.encryptRequest(commandJson, seq);
+      // The wire "packet" here is AES-128-CBC ciphertext (+ SHA-256
+      // signature prefix) — the SSID/password embedded in [commandJson]
+      // are never in the clear once encrypted, but we still only log
+      // length + hash, never the plaintext, per the redaction convention
+      // used everywhere else in this log.
+      Diagnostics.instance.packetSummary(
+        'klap.request',
+        encrypted.body,
+        attempt: seq,
+      );
 
       final url = Uri.parse('http://${host.address}/app/request?seq=$seq');
       final req = await client.postUrl(url).timeout(timeout);
@@ -320,10 +373,27 @@ class KlapTransport {
       req.add(encrypted.body);
       final resp = await req.close().timeout(timeout);
       if (resp.statusCode != 200) {
+        Diagnostics.instance.event(
+          'klap.request',
+          'seq=$seq failed: HTTP status ${resp.statusCode}',
+          level: DiagLevel.error,
+        );
         throw KlapException('request status ${resp.statusCode}');
       }
       final body = await _readAll(resp);
-      return session.decryptResponse(body, encrypted.iv);
+      final result = session.decryptResponse(body, encrypted.iv);
+      Diagnostics.instance.event('klap.request', 'seq=$seq succeeded');
+      return result;
+    } on KlapException {
+      rethrow;
+    } catch (e, st) {
+      // Never interpolate `$e` — see the note in `handshake()`.
+      Diagnostics.instance.event(
+        'klap.request',
+        'unexpected failure: ${e.runtimeType}\n$st',
+        level: DiagLevel.error,
+      );
+      rethrow;
     } finally {
       if (httpClient == null) client.close();
     }

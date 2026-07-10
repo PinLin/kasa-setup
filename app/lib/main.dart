@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'diagnostics.dart';
+import 'diagnostics_view.dart';
 import 'kasa/discovery.dart';
 import 'kasa/protocol.dart';
 import 'platform/platform_exception_codes.dart';
@@ -52,9 +55,13 @@ class SetupHomeScreen extends StatefulWidget {
         debugKasaApSsid = null,
         debugHomeNetworks = const [],
         debugDiscovered = null,
-        debugError = null;
+        debugError = null,
+        binderOverride = null;
 
   /// Debug constructor used by golden tests to render any state directly.
+  /// Tests can also inject a mock [WifiBinder] via [binderOverride] so the
+  /// full provision flow can be driven without touching a real platform
+  /// channel (see `_binder`).
   @visibleForTesting
   const SetupHomeScreen.preview({
     super.key,
@@ -63,6 +70,7 @@ class SetupHomeScreen extends StatefulWidget {
     this.debugHomeNetworks = const [],
     this.debugDiscovered,
     this.debugError,
+    this.binderOverride,
   });
 
   final SetupStep? debugInitialStep;
@@ -70,6 +78,10 @@ class SetupHomeScreen extends StatefulWidget {
   final List<WifiNetwork> debugHomeNetworks;
   final DiscoveredKasaDevice? debugDiscovered;
   final String? debugError;
+
+  /// Test-only injection point for a fake [WifiBinder]. Null in production,
+  /// where [_SetupHomeScreenState._binder] falls back to [createWifiBinder].
+  final WifiBinder? binderOverride;
 
   @override
   State<SetupHomeScreen> createState() => _SetupHomeScreenState();
@@ -80,7 +92,7 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
   String? _error;
 
   // Lazy so tests / debug previews don't try to attach a real MethodChannel.
-  WifiBinder get _binder => _wifiBinder ??= createWifiBinder();
+  WifiBinder get _binder => _wifiBinder ??= widget.binderOverride ?? createWifiBinder();
   WifiBinder? _wifiBinder;
 
   // The Kasa device AP SSID the phone is confirmed-joined to. Set ONLY when
@@ -140,13 +152,20 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
     _passwordCtl.dispose();
     _apPoller?.cancel();
     _apPoller = null;
-    _binder.leave();
+    // Use the nullable field, not the `_binder` getter — the getter lazily
+    // instantiates a real platform-specific WifiBinder (a live
+    // MethodChannel), which throws on hosts that are neither Android nor
+    // iOS (e.g. `flutter test` on macOS/Linux/Windows CI). If the flow
+    // never got past intro/done/error, no binder was ever created and
+    // there is nothing to leave.
+    _wifiBinder?.leave();
     super.dispose();
   }
 
   // ---- transitions ---------------------------------------------------------
 
   Future<void> _start() async {
+    Diagnostics.instance.event('flow', 'Setup flow started');
     if (!await _ensurePermissions()) {
       _showError(
         'Location + nearby Wi-Fi permissions are required to scan and join networks. '
@@ -168,9 +187,12 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
   Future<void> _scanKasaAps() async {
     if (!mounted) return;
     setState(() => _scanningKasaAps = true);
+    Diagnostics.instance.event('discover.ap', 'scanning for Kasa device hotspots');
     try {
       final found = await _binder.scanKasaSsids();
       if (!mounted) return;
+      Diagnostics.instance
+          .event('discover.ap', 'found ${found.length} candidate hotspot(s)');
       setState(() => _kasaApsFound = found);
       // If we see exactly one candidate and we're not already joining/joined,
       // kick off auto-join. Android still shows a system confirm dialog, but
@@ -191,9 +213,16 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
       _joiningKasaAp = ssid;
       _joinError = null;
     });
+    // Device-AP SSID text is never written to the diagnostic log, even
+    // though it is a device-broadcast, non-secret name — only its length,
+    // to keep the "never write SSID text" rule exceptionless.
+    Diagnostics.instance
+        .event('join.ap', 'joining hotspot (ssidLen=${ssid.length})');
     try {
       await _binder.joinOpenAp(ssid);
       if (!mounted) return;
+      Diagnostics.instance
+          .event('join.ap', 'joined hotspot (ssidLen=${ssid.length})');
       _apPoller?.cancel();
       _apPoller = null;
       unawaited(_refreshHomeNetworks());
@@ -203,12 +232,28 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
         _step = SetupStep.pickHomeWifi;
       });
     } on WifiBinderException catch (e) {
+      // Some WifiBinderException.message values (e.g. notKasa, noSsid)
+      // embed the literal current SSID for the UI's benefit — only the
+      // error code is safe to log, never e.message.
+      Diagnostics.instance.event(
+        'join.ap',
+        'join failed: code=${e.code.name}',
+        level: DiagLevel.error,
+      );
       if (!mounted) return;
       setState(() {
         _joiningKasaAp = null;
         _joinError = _describeError(e);
       });
-    } on Exception catch (e) {
+    } on Exception catch (e, st) {
+      // Never interpolate `$e` — an arbitrary Exception (e.g. a
+      // PlatformException surfaced from native join code) is not
+      // guaranteed not to embed the literal SSID in its message.
+      Diagnostics.instance.event(
+        'join.ap',
+        'unexpected join failure: ${e.runtimeType}\n$st',
+        level: DiagLevel.error,
+      );
       if (!mounted) return;
       setState(() {
         _joiningKasaAp = null;
@@ -220,7 +265,17 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
   Future<bool> _ensurePermissions() async {
     final loc = await Permission.locationWhenInUse.request();
     final near = await Permission.nearbyWifiDevices.request();
-    return loc.isGranted && (near.isGranted || near.isLimited);
+    final granted = loc.isGranted && (near.isGranted || near.isLimited);
+    if (granted) {
+      Diagnostics.instance.event('permission', 'location + nearbyWifi granted');
+    } else {
+      Diagnostics.instance.event(
+        'permission',
+        'permission check failed: location=${loc.name} nearbyWifi=${near.name}',
+        level: DiagLevel.warn,
+      );
+    }
+    return granted;
   }
 
   void _startApPolling() {
@@ -239,13 +294,28 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
     final ssid = await _binder.currentBoundSsid();
     if (!mounted) return;
     if (ssid != null && _looksLikeKasaAp(ssid)) {
+      Diagnostics.instance.event(
+        'join.ap',
+        'poller detected phone already on a Kasa hotspot '
+        '(manual join via system Wi-Fi settings, ssidLen=${ssid.length})',
+      );
       _apPoller?.cancel();
       _apPoller = null;
       // Bind the process to the Wi-Fi network so sockets go out via the AP.
       try {
         await _binder.bindToCurrentApIfKasa();
-      } on Exception {
+      } on Exception catch (e) {
         // If binding fails, still try to proceed — discovery may still work.
+        // Never log e.toString()/e.message here: for WifiBinderException the
+        // notKasa code's message is the literal current SSID (see
+        // WifiBinder.kt) — only the code (or, for other Exception types,
+        // only the runtimeType) is safe to record.
+        final detail = e is WifiBinderException ? e.code.name : '${e.runtimeType}';
+        Diagnostics.instance.event(
+          'join.ap',
+          'bindToCurrentApIfKasa failed (continuing anyway): $detail',
+          level: DiagLevel.warn,
+        );
       }
       // Re-scan now that we'd otherwise be cut off from home Wi-Fi visibility;
       // most Android implementations still let scanResults read from cache.
@@ -277,12 +347,23 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
     try {
       final found = await _binder.scan24GhzNetworks();
       if (!mounted) return;
+      // Never log the discovered SSID list — home-network names are
+      // location/household-identifying, so only the count is recorded.
+      Diagnostics.instance.event(
+        'discover.home_wifi',
+        'found ${found.length} 2.4GHz network(s) nearby',
+      );
       setState(() {
         _homeNetworks = found;
         // Auto-switch to manual-SSID entry the first time the scan returns
         // empty (5 GHz-only router, hidden SSID, scan failure). One-shot so
         // a successful follow-up scan doesn't flip the user back to the list.
         if (found.isEmpty && !_manualSsidMode && !_autoSwitchedToManual) {
+          Diagnostics.instance.event(
+            'discover.home_wifi',
+            'no 2.4GHz networks found — auto-switching to manual SSID entry',
+            level: DiagLevel.warn,
+          );
           _manualSsidMode = true;
           _autoSwitchedToManual = true;
         }
@@ -311,22 +392,39 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
     final keyType = _manualSsidMode
         ? _keyType
         : ((_selectedHomeNetwork?.secured ?? true) ? 3 : 0);
+    Diagnostics.instance.event(
+      'provision',
+      'provisioning started: homeSsidLen=${ssid.length} keyType=$keyType',
+    );
     try {
       setState(() => _step = SetupStep.sendingCredentials);
       await _sendSetStaInfoWithRetry(ssid: ssid, keyType: keyType);
+      Diagnostics.instance.event('provision', 'credentials delivered to device');
 
       setState(() => _step = SetupStep.waitingForJoin);
       await _binder.leave();
+      Diagnostics.instance.event(
+        'provision',
+        'left device AP; waiting ~12s for device to join home Wi-Fi and '
+        'phone to reattach',
+      );
       // Give the device ~12s to drop its AP, reboot Wi-Fi, and join the home
       // AP — and the phone time to reattach to its preferred Wi-Fi.
       await Future<void>.delayed(const Duration(seconds: 12));
 
       setState(() => _step = SetupStep.discoveringOnHomeWifi);
+      Diagnostics.instance
+          .event('discover.home_wifi.post', 'searching for device on home Wi-Fi');
       final device = await _findOnHomeWifi();
 
       if (!mounted || _step != SetupStep.discoveringOnHomeWifi) return;
 
       if (device == null) {
+        Diagnostics.instance.event(
+          'discover.home_wifi.post',
+          'device did not appear on home Wi-Fi after 5 scan rounds (~75s)',
+          level: DiagLevel.error,
+        );
         _showError(
           'The HS300 did not announce itself on your Wi-Fi. Most likely causes:\n'
           '  • Wrong home Wi-Fi password.\n'
@@ -338,14 +436,43 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
         return;
       }
 
+      Diagnostics.instance.event(
+        'discover.home_wifi.post',
+        'device found on home Wi-Fi: model=${device.model} klap=${device.klap}',
+      );
+      Diagnostics.instance.setDeviceInfo({
+        'model': device.model,
+        'alias': device.alias,
+        'hwVersion': device.hwVersion,
+        'swVersion': device.swVersion,
+        'mac': device.mac,
+        'ip': device.address.address,
+        'klap': device.klap,
+        'klapVersion': device.klapVersion,
+        'isUnbound': device.isUnbound,
+      });
+
       setState(() {
         _discovered = device;
         _step = SetupStep.done;
       });
     } on WifiBinderException catch (e) {
+      // e.message may embed a literal current SSID for some codes (see
+      // _joinKasaAp) — log only the code, never e.message.
+      Diagnostics.instance.event(
+        'provision',
+        'WifiBinderException: code=${e.code.name}',
+        level: DiagLevel.error,
+      );
       _showError(_describeError(e));
       await _binder.leave();
-    } on Exception catch (e) {
+    } on Exception catch (e, st) {
+      // Never interpolate `$e` — see the same note in `_joinKasaAp`.
+      Diagnostics.instance.event(
+        'provision',
+        'unexpected exception: ${e.runtimeType}\n$st',
+        level: DiagLevel.error,
+      );
       _showError(e.toString());
       await _binder.leave();
     }
@@ -369,6 +496,22 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
         await _binder.ensureJoinedAp();
         final device = await _discoverDeviceInApMode();
 
+        // "Packet assembled" node — records ssid/password *lengths* (never
+        // the literal strings) plus a short hash of the plaintext command
+        // JSON for support correlation. The actual wire bytes differ per
+        // transport (XOR for legacy TCP/UDP, AES-CBC for KLAP — see
+        // Kasa.send / KlapTransport.sendRequest for the KLAP-specific
+        // packetSummary of the truly-encrypted body); this call covers the
+        // command payload common to all of them.
+        Diagnostics.instance.packetSummary(
+          'provision.send',
+          utf8.encode(cmd),
+          attempt: attempt,
+          ssidLength: ssid.length,
+          passwordLength: _passwordCtl.text.length,
+          keyType: keyType,
+        );
+
         // Try TCP/9999 first — that is what python-kasa and the Kasa app
         // use. Some HS300 v2.0 units (observed on a TW unit, firmware
         // 1.0.x) accept the TCP handshake then immediately RST on accept,
@@ -376,6 +519,8 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
         // tiny TCP stack.
         try {
           await Kasa.send(device: device, command: cmd);
+          Diagnostics.instance
+              .event('provision.send', 'attempt $attempt: TCP/KLAP send succeeded');
           return;
         } on SocketException catch (e) {
           // errno 104 = ECONNRESET, 111 = ECONNREFUSED. Both mean TCP is
@@ -389,6 +534,12 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
           final retryable = e.osError?.errorCode == 104 ||
               e.osError?.errorCode == 111;
           if (retryable && !device.klap) {
+            Diagnostics.instance.event(
+              'provision.send',
+              'attempt $attempt: TCP failed (errno=${e.osError?.errorCode}), '
+              'falling back to UDP/9999',
+              level: DiagLevel.warn,
+            );
             await KasaTransport.udpUnicastSend(
               host: device.address,
               command: cmd,
@@ -398,17 +549,48 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
             // home Wi-Fi, so any reply on UDP/9999 from the AP IP would
             // race against that teardown. The next phase
             // (_findOnHomeWifi) is the real check.
+            Diagnostics.instance.event(
+              'provision.send',
+              'attempt $attempt: UDP/9999 fallback send completed (silence = '
+              'probable success — device tears down its AP once it parses '
+              'set_stainfo)',
+            );
             return;
           }
+          Diagnostics.instance.event(
+            'provision.send',
+            'attempt $attempt: TCP failed (errno=${e.osError?.errorCode}), '
+            'not eligible for UDP fallback (klap=${device.klap}), rethrowing',
+            level: DiagLevel.error,
+          );
           rethrow;
         }
-      } on WifiBinderException {
+      } on WifiBinderException catch (e) {
+        Diagnostics.instance.event(
+          'provision.send',
+          'attempt $attempt: WifiBinderException code=${e.code.name}, '
+          'aborting retries',
+          level: DiagLevel.error,
+        );
         rethrow;
       } catch (e) {
         lastErr = e;
+        // Never interpolate `$e` — see the note in `_joinKasaAp`; e can be
+        // a KlapException, SocketException, etc. whose message isn't
+        // guaranteed credential-free.
+        Diagnostics.instance.event(
+          'provision.send',
+          'attempt $attempt failed: ${e.runtimeType} — retrying after backoff',
+          level: DiagLevel.warn,
+        );
         await Future<void>.delayed(Duration(milliseconds: 500 * attempt));
       }
     }
+    Diagnostics.instance.event(
+      'provision.send',
+      'all 4 attempts exhausted, last error type: ${lastErr.runtimeType}',
+      level: DiagLevel.error,
+    );
     throw Exception('Could not deliver credentials to device: $lastErr');
   }
 
@@ -416,9 +598,21 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
   Future<DiscoveredKasaDevice> _discoverDeviceInApMode() async {
     await for (final dev
         in KasaDiscovery.scan(timeout: const Duration(seconds: 4))) {
-      if (dev.isHs300) return dev;
+      if (dev.isHs300) {
+        Diagnostics.instance.event(
+          'discover.ap_mode',
+          'found device on device AP: model=${dev.model} klap=${dev.klap}',
+        );
+        return dev;
+      }
     }
     // AP gateway fallback (legacy XOR). Will fail loudly on 1.1.x.
+    Diagnostics.instance.event(
+      'discover.ap_mode',
+      'no device found via broadcast discovery on device AP; falling back '
+      'to gateway IP 192.168.0.1 assumption',
+      level: DiagLevel.warn,
+    );
     return DiscoveredKasaDevice(
       address: InternetAddress('192.168.0.1'),
       model: 'HS300',
@@ -515,6 +709,8 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
   }
 
   void _restart() {
+    Diagnostics.instance.clear();
+    Diagnostics.instance.event('flow', 'user restarted the setup flow — log cleared');
     _apPoller?.cancel();
     _apPoller = null;
     setState(() {
@@ -550,6 +746,15 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
       appBar: AppBar(
         title: const Text('Kasa HS300 Setup'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.bug_report_outlined),
+            tooltip: 'View diagnostics',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const DiagnosticsView()),
+            ),
+          ),
+        ],
       ),
       body: SafeArea(
         child: Padding(
@@ -679,7 +884,12 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
               child: OutlinedButton.icon(
                 icon: const Icon(Icons.settings),
                 label: const Text('Wi-Fi Settings'),
-                onPressed: _binder.openWifiSettings,
+                // Wrapped in a closure (not a tear-off) so the lazy `_binder`
+                // getter — and the real platform-channel object it creates —
+                // is only touched on tap, not during every build(). A bare
+                // tear-off evaluates `_binder` eagerly, which throws on
+                // non-Android/iOS hosts (e.g. `flutter test`).
+                onPressed: () => _binder.openWifiSettings(),
               ),
             ),
           ],
@@ -859,44 +1069,21 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
       return;
     }
 
-    final ctl = TextEditingController();
-    var show = false;
+    // The controller lives inside _PasswordPromptDialog's own State, disposed
+    // in its dispose() — i.e. only once the dialog element is unmounted, which
+    // happens *after* the exit transition finishes. Disposing it inline here
+    // instead (right after `await showDialog` returns) is unsafe: showDialog's
+    // future completes the moment Navigator.pop is called, while the dialog is
+    // still animating out and its TextField still references the controller.
+    // The subsequent setState + _provision below trigger a global rebuild that
+    // propagates into the still-mounted dialog; its transition re-subscribes to
+    // the (now-disposed) controller, throwing "TextEditingController used after
+    // being disposed", which corrupts the overlay teardown and surfaces as the
+    // framework's `InheritedElement _dependents.isEmpty` assertion (red screen).
     final password = await showDialog<String>(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setLocal) => AlertDialog(
-          title: Text('Password for "${n.ssid}"'),
-          content: TextField(
-            controller: ctl,
-            autofocus: true,
-            obscureText: !show,
-            decoration: InputDecoration(
-              labelText: 'Wi-Fi Password',
-              border: const OutlineInputBorder(),
-              suffixIcon: IconButton(
-                icon: Icon(show ? Icons.visibility_off : Icons.visibility),
-                onPressed: () => setLocal(() => show = !show),
-              ),
-            ),
-            onSubmitted: (v) =>
-                v.isEmpty ? null : Navigator.pop(ctx, v),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => ctl.text.isEmpty
-                  ? null
-                  : Navigator.pop(ctx, ctl.text),
-              child: const Text('Provision'),
-            ),
-          ],
-        ),
-      ),
+      builder: (ctx) => _PasswordPromptDialog(ssid: n.ssid),
     );
-    ctl.dispose();
     if (password == null || password.isEmpty || !mounted) return;
     setState(() {
       _selectedHomeNetwork = n;
@@ -1097,6 +1284,63 @@ class _SetupHomeScreenState extends State<SetupHomeScreen> {
         ),
         const SizedBox(height: 16),
         FilledButton(onPressed: _restart, child: const Text('Start over')),
+      ],
+    );
+  }
+}
+
+/// Modal password prompt for a secured home network. Owns its own
+/// [TextEditingController] so the controller is disposed exactly when this
+/// dialog's element unmounts (after the exit transition), never while the
+/// still-animating TextField references it. Pops the entered password on
+/// Provision / submit, or null on Cancel.
+class _PasswordPromptDialog extends StatefulWidget {
+  const _PasswordPromptDialog({required this.ssid});
+
+  final String ssid;
+
+  @override
+  State<_PasswordPromptDialog> createState() => _PasswordPromptDialogState();
+}
+
+class _PasswordPromptDialogState extends State<_PasswordPromptDialog> {
+  final _ctl = TextEditingController();
+  bool _show = false;
+
+  @override
+  void dispose() {
+    _ctl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Password for "${widget.ssid}"'),
+      content: TextField(
+        controller: _ctl,
+        autofocus: true,
+        obscureText: !_show,
+        decoration: InputDecoration(
+          labelText: 'Wi-Fi Password',
+          border: const OutlineInputBorder(),
+          suffixIcon: IconButton(
+            icon: Icon(_show ? Icons.visibility_off : Icons.visibility),
+            onPressed: () => setState(() => _show = !_show),
+          ),
+        ),
+        onSubmitted: (v) => v.isEmpty ? null : Navigator.pop(context, v),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () =>
+              _ctl.text.isEmpty ? null : Navigator.pop(context, _ctl.text),
+          child: const Text('Provision'),
+        ),
       ],
     );
   }

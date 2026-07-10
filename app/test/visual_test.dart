@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:kasa_setup/kasa/discovery.dart';
 import 'package:kasa_setup/main.dart';
+import 'package:kasa_setup/platform/wifi_binder.dart';
 
 Future<void> _pumpAt(
   WidgetTester tester,
@@ -65,54 +66,62 @@ void main() {
     await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/01_intro.png'));
   });
 
-  testWidgets('02 enterCredentials', (tester) async {
-    await _pumpAt(tester, const SetupHomeScreen.preview(debugInitialStep: SetupStep.enterCredentials));
-    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/02_credentials.png'));
+  testWidgets('02 awaitDevice — no hotspots found yet', (tester) async {
+    await _pumpAt(tester, const SetupHomeScreen.preview(debugInitialStep: SetupStep.awaitDevice));
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/02_await_device.png'));
   });
 
-  testWidgets('03 needPermission', (tester) async {
-    await _pumpAt(tester, const SetupHomeScreen.preview(debugInitialStep: SetupStep.needPermission));
-    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/03_need_permission.png'));
-  });
-
-  testWidgets('04 scanForDevice empty', (tester) async {
-    await _pumpAt(tester, const SetupHomeScreen.preview(debugInitialStep: SetupStep.scanForDevice));
-    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/04_scan_empty.png'));
-  });
-
-  testWidgets('05 scanForDevice with one device', (tester) async {
+  testWidgets('03 pickHomeWifi — no nearby networks (manual-entry prompt)', (tester) async {
     await _pumpAt(
       tester,
       const SetupHomeScreen.preview(
-        debugInitialStep: SetupStep.scanForDevice,
-        debugKasaSsids: ['TP-LINK_Power Strip_0A00'],
+        debugInitialStep: SetupStep.pickHomeWifi,
+        debugKasaApSsid: 'TP-LINK_Power Strip_0A00',
       ),
     );
-    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/05_scan_one.png'));
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/03_pick_home_wifi_empty.png'));
   });
 
-  testWidgets('06 scanForDevice with multiple devices', (tester) async {
+  testWidgets('04 pickHomeWifi — nearby networks listed', (tester) async {
     await _pumpAt(
       tester,
       const SetupHomeScreen.preview(
-        debugInitialStep: SetupStep.scanForDevice,
-        debugKasaSsids: [
-          'TP-LINK_Power Strip_0A00',
-          'TP-LINK_Smart Plug_F427',
-          'Kasa_Smart Plug_3D9B',
+        debugInitialStep: SetupStep.pickHomeWifi,
+        debugKasaApSsid: 'TP-LINK_Power Strip_0A00',
+        debugHomeNetworks: [
+          WifiNetwork(ssid: 'HomeWifi_5G', signalDbm: -50, secured: true),
+          WifiNetwork(ssid: 'GuestNet', signalDbm: -70, secured: false),
         ],
       ),
     );
-    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/06_scan_many.png'));
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/04_pick_home_wifi_list.png'));
   });
 
-  testWidgets('07 busy state (sendingCredentials)', (tester) async {
+  testWidgets('05 busy — sendingCredentials', (tester) async {
     await _pumpAt(
       tester,
       const SetupHomeScreen.preview(debugInitialStep: SetupStep.sendingCredentials),
       settle: false,
     );
-    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/07_sending.png'));
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/05_sending_credentials.png'));
+  });
+
+  testWidgets('06 busy — waitingForJoin', (tester) async {
+    await _pumpAt(
+      tester,
+      const SetupHomeScreen.preview(debugInitialStep: SetupStep.waitingForJoin),
+      settle: false,
+    );
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/06_waiting_for_join.png'));
+  });
+
+  testWidgets('07 busy — discoveringOnHomeWifi', (tester) async {
+    await _pumpAt(
+      tester,
+      const SetupHomeScreen.preview(debugInitialStep: SetupStep.discoveringOnHomeWifi),
+      settle: false,
+    );
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/07_discovering_on_home_wifi.png'));
   });
 
   testWidgets('08 done — legacy firmware (no KLAP warning)', (tester) async {
