@@ -18,6 +18,12 @@ android {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
+    buildFeatures {
+        // Required since AGP 8: BuildConfig generation is opt-in. Needed so
+        // MainActivity can pass BuildConfig.VERSION_CODE to FreeDroidWarn.
+        buildConfig = true
+    }
+
     defaultConfig {
         applicationId = "me.pinlin.kasa_setup"
         // WifiNetworkSpecifier was added in API 29 (Android 10). The whole
@@ -41,4 +47,9 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Pinned (not V1.+) per repo policy: see https://github.com/woheller69/FreeDroidWarn tags.
+    implementation("com.github.woheller69:FreeDroidWarn:V1.13")
 }
